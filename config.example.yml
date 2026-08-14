@@ -17,8 +17,13 @@ server:
 
 devices:
   aisatellite1:
+    # Which IP should be pinged as part of the uptime check.
     ping: "192.168.178.67"
+    # Which MAC should be broadcasted as part of the Wake-on-LAN magic packet.
     mac: "AA:BB:CC:DD:EE:FF"
+    # AI-idle seconds before /suspend/aisatellite1 reports true.
+    suspend_after: 1800
+    # All OpenAI-compatible endpoints this device exposes.
     endpoints:
       - "http://aisatellite1:8080/v1"
 

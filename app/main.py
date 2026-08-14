@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from starlette.responses import Response
+from starlette.responses import PlainTextResponse, Response
 
 from app.config import get_app_paths, load_config
 from app.database import ModelRoute, RouteDatabase
@@ -16,6 +16,7 @@ from app.proxy import (
     forward_request,
     models_response,
 )
+from app.suspend import SuspendTracker
 from app.wake import WakeCoordinator
 
 
@@ -74,11 +75,13 @@ async def lifespan(application: FastAPI):
         if routes:
             logger.info("Active model routes: %s", _format_routes(routes))
         wake = WakeCoordinator(config.server, config.devices, client)
+        suspend = SuspendTracker(config.devices)
         application.state.runtime = RouterRuntime(
             config=config,
             routes=routes,
             client=client,
             wake=wake,
+            suspend=suspend,
         )
         logger.info(
             "LLazarus ready with %d cached model route(s) from %d device(s)",
@@ -104,6 +107,15 @@ app = FastAPI(
 async def list_models(request: Request) -> Response:
     runtime: RouterRuntime = request.app.state.runtime
     return models_response(runtime.routes)
+
+
+@app.get("/suspend/{device}", response_class=PlainTextResponse)
+async def should_suspend(device: str, request: Request) -> Response:
+    runtime: RouterRuntime = request.app.state.runtime
+    if device not in runtime.config.devices:
+        return Response(status_code=404)
+    result = await runtime.suspend.should_suspend(device)
+    return PlainTextResponse("true" if result else "false")
 
 
 @app.post("/v1/{path:path}")

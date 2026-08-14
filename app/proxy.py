@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable
+from contextlib import suppress
 from dataclasses import dataclass
 
 import httpx
@@ -13,6 +15,7 @@ from starlette.responses import Response
 
 from app.config import RouterConfig
 from app.database import ModelRoute
+from app.suspend import ActivityLease, SuspendTracker
 from app.wake import (
     DeviceUnavailableError,
     EndpointUnavailableError,
@@ -48,6 +51,11 @@ class RouterRuntime:
     routes: dict[str, ModelRoute]
     client: httpx.AsyncClient
     wake: WakeCoordinator
+    suspend: SuspendTracker
+
+
+class _ClientDisconnected(RuntimeError):
+    pass
 
 
 async def discover_models(
@@ -172,6 +180,8 @@ async def forward_request(
         )
 
     device = runtime.config.devices[route.device]
+    activity = await runtime.suspend.start_request(route.device)
+    activity_handed_to_response = False
     logger.info(
         "Routing path=/v1/%s model=%s to device=%s endpoint=%s",
         path,
@@ -180,61 +190,129 @@ async def forward_request(
         route.endpoint,
     )
     try:
-        await runtime.wake.ensure_ready(device, route.endpoint)
-    except (DeviceUnavailableError, EndpointUnavailableError) as exc:
-        logger.warning("Route unavailable for model=%s: %s", model_id, exc)
-        return openai_error(
-            status_code=503,
-            message=str(exc),
-            error_type="service_unavailable_error",
-            code="service_unavailable",
+        try:
+            upstream_response = await _open_upstream_or_disconnect(
+                request,
+                _open_upstream(request, path, body, runtime, route),
+            )
+        except _ClientDisconnected:
+            logger.info(
+                "Client disconnected before backend stream started for model=%s",
+                model_id,
+            )
+            return Response(status_code=499)
+        except (DeviceUnavailableError, EndpointUnavailableError) as exc:
+            logger.warning("Route unavailable for model=%s: %s", model_id, exc)
+            return openai_error(
+                status_code=503,
+                message=str(exc),
+                error_type="service_unavailable_error",
+                code="service_unavailable",
+            )
+        except httpx.RequestError as exc:
+            logger.warning("Backend request to %s failed: %s", route.endpoint, exc)
+            return openai_error(
+                status_code=503,
+                message=f"Backend endpoint {route.endpoint} became unavailable",
+                error_type="service_unavailable_error",
+                code="service_unavailable",
+            )
+
+        logger.info(
+            "Backend responded model=%s status=%d content-type=%s",
+            model_id,
+            upstream_response.status_code,
+            upstream_response.headers.get("content-type", "unknown"),
         )
+
+        async def stream_upstream():
+            try:
+                async for chunk in upstream_response.aiter_raw():
+                    yield chunk
+            except httpx.RequestError as exc:
+                logger.warning("Backend stream interrupted for model=%s: %s", model_id, exc)
+                raise
+            finally:
+                await _finish_upstream(upstream_response, activity)
+
+        response = StreamingResponse(
+            stream_upstream(),
+            status_code=upstream_response.status_code,
+            background=BackgroundTask(_finish_upstream, upstream_response, activity),
+        )
+        response.raw_headers = _filtered_response_headers(upstream_response.headers.raw)
+        activity_handed_to_response = True
+        return response
+    finally:
+        if not activity_handed_to_response:
+            await activity.close()
+
+
+async def _open_upstream(
+    request: Request,
+    path: str,
+    body: bytes,
+    runtime: RouterRuntime,
+    route: ModelRoute,
+) -> httpx.Response:
+    device = runtime.config.devices[route.device]
+    await runtime.wake.ensure_ready(device, route.endpoint)
 
     target_url = f"{route.endpoint}/{path}"
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
-
     upstream_request = runtime.client.build_request(
         method=request.method,
         url=target_url,
         headers=_filtered_request_headers(request.headers.raw),
         content=body,
     )
+    return await runtime.client.send(upstream_request, stream=True)
+
+
+async def _open_upstream_or_disconnect(
+    request: Request,
+    operation: Awaitable[httpx.Response],
+) -> httpx.Response:
+    operation_task = asyncio.ensure_future(operation)
+    disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
     try:
-        upstream_response = await runtime.client.send(upstream_request, stream=True)
-    except httpx.RequestError as exc:
-        logger.warning("Backend request to %s failed: %s", route.endpoint, exc)
-        return openai_error(
-            status_code=503,
-            message=f"Backend endpoint {route.endpoint} became unavailable",
-            error_type="service_unavailable_error",
-            code="service_unavailable",
+        done, _ = await asyncio.wait(
+            {operation_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        if disconnect_task in done:
+            if operation_task.done() and not operation_task.cancelled():
+                with suppress(Exception):
+                    response = operation_task.result()
+                    await response.aclose()
+            else:
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            raise _ClientDisconnected
+        return await operation_task
+    finally:
+        disconnect_task.cancel()
+        if not operation_task.done():
+            operation_task.cancel()
+        await asyncio.gather(operation_task, disconnect_task, return_exceptions=True)
 
-    logger.info(
-        "Backend responded model=%s status=%d content-type=%s",
-        model_id,
-        upstream_response.status_code,
-        upstream_response.headers.get("content-type", "unknown"),
-    )
 
-    async def stream_upstream():
-        try:
-            async for chunk in upstream_response.aiter_raw():
-                yield chunk
-        except httpx.RequestError as exc:
-            logger.warning("Backend stream interrupted for model=%s: %s", model_id, exc)
-            raise
-        finally:
-            await upstream_response.aclose()
+async def _wait_for_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
 
-    response = StreamingResponse(
-        stream_upstream(),
-        status_code=upstream_response.status_code,
-        background=BackgroundTask(upstream_response.aclose),
-    )
-    response.raw_headers = _filtered_response_headers(upstream_response.headers.raw)
-    return response
+
+async def _finish_upstream(
+    upstream_response: httpx.Response,
+    activity: ActivityLease,
+) -> None:
+    try:
+        await upstream_response.aclose()
+    finally:
+        await activity.close()
 
 
 def _extract_model_id(body: bytes) -> str | JSONResponse:

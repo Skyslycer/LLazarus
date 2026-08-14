@@ -43,6 +43,7 @@ class DeviceConfig:
     endpoints: tuple[str, ...]
     ping: str | None = None
     mac: str | None = None
+    suspend_after: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +143,7 @@ def _load_devices(raw: Any) -> dict[str, DeviceConfig]:
         if not isinstance(device_raw, dict):
             raise ConfigError(f"devices.{name} must be a mapping")
 
-        unknown = set(device_raw) - {"ping", "mac", "endpoints"}
+        unknown = set(device_raw) - {"ping", "mac", "suspend_after", "endpoints"}
         if unknown:
             raise ConfigError(
                 f"Unknown setting(s) for device {name}: {', '.join(sorted(unknown))}"
@@ -162,11 +163,18 @@ def _load_devices(raw: Any) -> dict[str, DeviceConfig]:
 
         ping = _optional_string(device_raw.get("ping"), f"devices.{name}.ping")
         mac = _normalize_mac(device_raw.get("mac"), f"devices.{name}.mac")
+        suspend_after_raw = device_raw.get("suspend_after")
+        suspend_after = (
+            _positive_float(suspend_after_raw, f"devices.{name}.suspend_after")
+            if suspend_after_raw is not None
+            else None
+        )
         devices[name] = DeviceConfig(
             name=name,
             endpoints=tuple(endpoints),
             ping=ping,
             mac=mac,
+            suspend_after=suspend_after,
         )
 
     return devices
