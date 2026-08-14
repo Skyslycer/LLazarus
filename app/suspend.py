@@ -50,7 +50,7 @@ class SuspendTracker:
             for name, device in devices.items()
         }
         policies = [
-            f"{name}={state.suspend_after:.3g}s"
+            f"{name}={state.suspend_after:g}s"
             for name, state in self._devices.items()
             if state.suspend_after is not None
         ]
@@ -81,7 +81,7 @@ class SuspendTracker:
                     logger.info("Device %s is idle; automatic suspend is disabled", device)
                 else:
                     logger.info(
-                        "Device %s is idle; suspend eligible in %.3g second(s)",
+                        "Device %s is idle; suspend eligible in %g second(s)",
                         device,
                         state.suspend_after,
                     )

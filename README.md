@@ -12,7 +12,7 @@ It has no UI, authentication, scheduler, model manager, or automatic sleep logic
 Letting all inference satellites run permanently not only consumes heaps of electricity,
 but may also reduce their lifespan. Letting satellites suspend especially makes
 sense for rarely-used inference satellites. Instead of manually waking the satellite,
-LLazarus does that seamlessly by being the middle man between the AI frontend and the model.
+LLazarus does that seamlessly by being the middleman between the AI frontend and the model.
 
 ### Why the name?
 
@@ -89,8 +89,13 @@ server:
 
 devices:
   aisatellite1:
+    # Which IP should be pinged as part of the uptime check.
     ping: "192.168.178.67"
+    # Which MAC should be broadcasted as part of the Wake-on-LAN magic packet.
     mac: "AA:BB:CC:DD:EE:FF"
+    # AI-idle seconds before /suspend/aisatellite1 reports true.
+    suspend_after: 1800
+    # All OpenAI-compatible endpoints this device exposes.
     endpoints:
       - "http://aisatellite1:8080/v1"
 
@@ -111,9 +116,81 @@ device state and `/models` represents inference-service state. If ping succeeds
 but the endpoint is unavailable, the router waits for the service and does not
 send WoL again. Without `ping`, endpoint reachability is used as the wake signal.
 
+`suspend_after` is optional and measured in seconds. It controls only LLazarus's
+local AI-idle policy; LLazarus never suspends a device itself. A satellite can poll
+`GET /suspend/{device}` and combine that answer with its own checks, such as active
+SSH sessions, before deciding whether to run `systemctl suspend`.
+
 Model IDs form one global namespace because `model_id` is the SQLite primary key.
 Give models unique IDs across endpoints. If multiple reachable endpoints report
 the same ID, the last endpoint in YAML order owns that route after discovery.
+
+## Suspend satellite
+
+To make the satellite auto-suspend when LLazarus requests it, you'll need to create a helper file, a service and a timer.
+
+Helper file: `/usr/local/bin/llazarus-suspend-check.sh` (Make sure to replace `LLAZARUS_URL` and `DEVICE` accordingly!)
+```sh
+#!/bin/bash
+
+LLAZARUS_URL="http://TRUENAS-IP:4000"
+DEVICE="aisatellite1"
+
+# Stay awake while someone is logged in.
+if [ -n "$(who)" ]; then
+    exit 0
+fi
+
+# Ask LLazarus whether this device should suspend.
+# If LLazarus cannot be reached, stay awake.
+SUSPEND=$(
+    curl -fsS \
+        --connect-timeout 2 \
+        --max-time 5 \
+        "$LLAZARUS_URL/suspend/$DEVICE"
+) || exit 0
+
+[ "$SUSPEND" = "true" ] || exit 0
+
+logger -t llazarus-suspend "LLazarus requested suspend; no user logged in"
+
+systemctl suspend
+```
+
+Service: `/etc/systemd/system/llazarus-suspend-check.service`
+```toml
+[Unit]
+Description=Check LLazarus AI suspend state
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/llazarus-suspend-check.sh
+```
+
+Timer: `/etc/systemd/system/ai-suspend-check.timer`
+```toml
+[Unit]
+Description=Check LLazarus suspend state every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+```
+
+Then make the helper file executable: `sudo chmod +x /usr/local/bin/llazarus-suspend-check.sh`
+
+Reload the daemon: `sudo systemctl daemon-reload`
+
+And enable the timer: `sudo systemctl enable --now llazarus-suspend-check.timer`
+
+Verify that it's running: `systemctl status llazarus-suspend-check.timer`
+
+Now your inference satellite should automatically suspend after the specified idle time has passed.
+Make sure you're logged out while testing, otherwise the satellite will skip the requests entirely!
 
 ## API
 
@@ -129,6 +206,19 @@ The router exposes cached models without waking any device:
 ```sh
 curl http://TRUENAS-IP:4000/v1/models
 ```
+
+A configured device can query its locally tracked suspend policy:
+
+```sh
+curl http://TRUENAS-IP:4000/suspend/aisatellite1
+```
+
+This returns only plain-text `true` or `false`. It returns `false` while any
+proxied inference request for that device is active. When the final concurrent
+request finishes, disconnects, or errors, the idle timer resets. It becomes
+`true` after the full `suspend_after` period. Devices without `suspend_after`
+always receive `false`, and unknown device names receive HTTP 404. This endpoint
+uses in-memory state only and never pings, wakes, or contacts the satellite.
 
 All `POST /v1/*` requests with a top-level `model` field are routed generically,
 including chat completions, completions, embeddings, and responses. Backend HTTP
