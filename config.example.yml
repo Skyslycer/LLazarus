@@ -1,0 +1,34 @@
+server:
+  port: 4000
+  # Maximum time for one ICMP ping attempt, in seconds.
+  ping_timeout: 1
+  # Delay between ping attempts while waiting for a device to wake, in seconds.
+  ping_interval: 0.5
+  # Maximum total time to wait for a sleeping device to respond after WoL, in seconds.
+  wake_timeout: 30
+  # Maximum time to wait for the inference endpoint after the device responds to ping, in seconds.
+  service_timeout: 60
+  # Maximum time to establish a TCP connection to an inference endpoint, in seconds.
+  connect_timeout: 2
+  # Maximum time without receiving response data from the backend, in seconds.
+  read_timeout: 1800
+  # Maximum time allowed while sending a request to the backend, in seconds.
+  write_timeout: 30
+
+devices:
+  aisatellite1:
+    ping: "192.168.178.67"
+    mac: "AA:BB:CC:DD:EE:FF"
+    endpoints:
+      - "http://aisatellite1:8080/v1"
+
+  gpu-server:
+    ping: "192.168.178.100"
+    mac: "11:22:33:44:55:66"
+    endpoints:
+      - "http://gpu-server:8000/v1"
+      - "http://gpu-server:8001/v1"
+
+  always-on:
+    endpoints:
+      - "http://server:8000/v1"
