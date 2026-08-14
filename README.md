@@ -158,7 +158,7 @@ systemctl suspend
 ```
 
 Service: `/etc/systemd/system/llazarus-suspend-check.service`
-```toml
+```ini
 [Unit]
 Description=Check LLazarus AI suspend state
 After=network-online.target
@@ -169,7 +169,7 @@ ExecStart=/usr/local/bin/llazarus-suspend-check.sh
 ```
 
 Timer: `/etc/systemd/system/ai-suspend-check.timer`
-```toml
+```ini
 [Unit]
 Description=Check LLazarus suspend state every minute
 
